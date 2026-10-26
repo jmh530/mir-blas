@@ -1,6 +1,10 @@
 /++
 Low-level ndslice wrapper for BLAS.
 
+Vector arguments follow the logical order of their ndslice views, including
+reversed views and non-unit strides. Maximum indices refer to that logical
+order; ties select the first maximum.
+
 Authors: Ilya Yaroshenko
 Copyright:  Copyright © 2017, Symmetry Investments & Kaleidic Associates
 +/
@@ -24,6 +28,28 @@ private auto matrixStride(S)(S a)
     return a._stride != 1 ? a._stride : a.length!1;
 }
 
+// ndslice points at the first logical element. BLAS applies its own starting
+// offset for negative increments, so supply the lowest-addressed element.
+// For a nonempty valid view this is another element of the same allocation;
+// empty views must not perform pointer arithmetic. Used only by trusted FFI calls.
+private auto vectorBase(T, SliceKind kind)(Slice!(T*, 1, kind) x)
+    @system pure nothrow @nogc
+{
+    return x._stride < 0 && x.length
+        ? x.iterator + cast(ptrdiff_t)(x.length - 1) * x._stride
+        : x.iterator;
+}
+
+// These order-independent operations require positive native increments.
+private auto forwardVector(T, SliceKind kind)(Slice!(T*, 1, kind) x)
+    @safe pure nothrow @nogc
+{
+    static if (kind == Universal)
+        if (x._stride < 0)
+            return x.reversed;
+    return x;
+}
+
 ///
 @trusted pure nothrow @nogc
 T dot(T,
@@ -42,10 +68,10 @@ do
     return cblas.dot(
         cast(cblas.blasint) x.length,
 
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
 
-        y.iterator,
+        vectorBase(y),
         cast(cblas.blasint) y._stride,
     );
 }
@@ -58,9 +84,10 @@ auto nrm2(T,
     Slice!(const(T)*, 1, kindX) x,
     )
 {
+    x = forwardVector(x);
     return cblas.nrm2(
         cast(cblas.blasint) x.length,
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
     );
 }
@@ -73,9 +100,10 @@ auto asum(T,
     Slice!(const(T)*, 1, kindX) x,
     )
 {
+    x = forwardVector(x);
     return cblas.asum(
         cast(cblas.blasint) x.length,
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
     );
 }
@@ -99,9 +127,9 @@ do
     cblas.axpy(
         cast(cblas.blasint) x.length,
         a,
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
-        y.iterator,
+        vectorBase(y),
         cast(cblas.blasint) y._stride,
     );
 }
@@ -115,10 +143,11 @@ void scal(T,
     Slice!(T*, 1, kindX) x,
     )
 {
+    x = forwardVector(x);
     cblas.scal(
         cast(cblas.blasint) x.length,
         a,
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
     );
 }
@@ -140,9 +169,9 @@ do
 {
     cblas.copy(
         cast(cblas.blasint) x.length,
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
-        y.iterator,
+        vectorBase(y),
         cast(cblas.blasint) y._stride,
     );
 }
@@ -164,9 +193,9 @@ do
 {
     cblas.swap(
         cast(cblas.blasint) x.length,
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
-        y.iterator,
+        vectorBase(y),
         cast(cblas.blasint) y._stride,
     );
 }
@@ -214,10 +243,10 @@ do
 
         alpha,
 
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
 
-        y.iterator,
+        vectorBase(y),
         cast(cblas.blasint) y._stride,
 
         a.iterator,
@@ -268,10 +297,10 @@ do
 
         alpha,
 
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
 
-        y.iterator,
+        vectorBase(y),
         cast(cblas.blasint) y._stride,
 
         a.iterator,
@@ -372,12 +401,12 @@ do
         a.iterator,
         cast(cblas.blasint) a.matrixStride,
 
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
 
         beta,
 
-        y.iterator,
+        vectorBase(y),
         cast(cblas.blasint) y._stride,
     );
 }
@@ -941,12 +970,12 @@ do
         a.iterator,
         cast(cblas.blasint) a.matrixStride,
 
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
 
         beta,
 
-        y.iterator,
+        vectorBase(y),
         cast(cblas.blasint) y._stride,
     );
 }
@@ -1057,7 +1086,11 @@ unittest
     alias D3 = symm!(double, Universal, Universal, Universal);
 }
 
-///
+/++
+Return the index of the first element of maximum absolute value in the logical
+view. Complex elements use `abs(real) + abs(imaginary)`. An empty view returns
+zero, following the CBLAS convention.
++/
 @trusted pure nothrow @nogc
 auto iamax(T,
     SliceKind kindX,
@@ -1065,9 +1098,34 @@ auto iamax(T,
     Slice!(const(T)*, 1, kindX) x,
     )
 {
+    if (x._stride < 0 && x.length)
+    {
+        // A forward native call would choose the last logical maximum on ties.
+        import std.math: fabs;
+        auto magnitude(T value)
+        {
+            static if (isFloatingPoint!T)
+                return fabs(value);
+            else
+                return fabs(value.re) + fabs(value.im);
+        }
+        cblas.CBLAS_INDEX result = 0;
+        auto maximum = magnitude(x[0]);
+        foreach (i; 1 .. x.length)
+        {
+            auto value = magnitude(x[i]);
+            if (value > maximum)
+            {
+                maximum = value;
+                result = cast(cblas.CBLAS_INDEX) i;
+            }
+        }
+        return result;
+    }
+
     return cblas.iamax(
         cast(cblas.blasint) x.length,
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
     );
 }
@@ -1116,7 +1174,7 @@ do
 
         alpha,
 
-        a.iterator,
+        vectorBase(a),
         cast(cblas.blasint) a._stride,
 
         c.iterator,
@@ -1203,7 +1261,7 @@ do
 
         alpha,
 
-        a.iterator,
+        vectorBase(a),
         cast(cblas.blasint) a._stride,
 
         c.iterator._iterator
@@ -1287,12 +1345,12 @@ do
 
         a.iterator._iterator,
 
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
 
         beta,
 
-        y.iterator,
+        vectorBase(y),
         cast(cblas.blasint) y._stride,
     );
 }
@@ -1390,7 +1448,7 @@ do
         a.iterator,
         cast(cblas.blasint) a._stride,
 
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
     );
 }
@@ -1495,7 +1553,7 @@ do
 
         a.iterator._iterator,
 
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
     );
 }
@@ -1600,7 +1658,7 @@ do
         a.iterator,
         cast(cblas.blasint) a._stride,
 
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
     );
 }
@@ -1705,7 +1763,7 @@ do
 
         a.iterator._iterator,
 
-        x.iterator,
+        vectorBase(x),
         cast(cblas.blasint) x._stride,
     );
 }
@@ -1766,4 +1824,130 @@ unittest
     alias D0 = tpsv!(double, Contiguous, "-");
     alias S1 = tpsv!(double, Universal, "+");
     alias D1 = tpsv!(double, Universal, "-");
+}
+// Reversed views retain logical pairing and leave skipped elements untouched.
+@safe pure nothrow @nogc
+unittest
+{
+    import std.math: fabs, sqrt;
+    foreach (reverseX; [false, true])
+    foreach (reverseY; [false, true])
+    {
+        double[8] sx = -99, sy = -99;
+        auto x = sx[1 .. 6].sliced.universal.strided(2);
+        auto y = sy[1 .. 6].sliced.universal.strided(2);
+        if (reverseX) x = x.reversed;
+        if (reverseY) y = y.reversed;
+        x[0] = 1; x[1] = -2; x[2] = 3;
+        y[0] = 4; y[1] = 5; y[2] = -6;
+        assert(dot(x.lightConst, y.lightConst) == -24);
+        assert(fabs(nrm2(x.lightConst) - sqrt(14.0)) < 1e-12);
+        assert(asum(x.lightConst) == 6);
+        assert(iamax(x.lightConst) == 2);
+        axpy(2.0, x.lightConst, y);
+        assert(y[0] == 6 && y[1] == 1 && y[2] == 0);
+        copy(x.lightConst, y);
+        scal(2.0, x);
+        swap(x, y);
+        assert(x[0] == 1 && x[1] == -2 && x[2] == 3);
+        assert(y[0] == 2 && y[1] == -4 && y[2] == 6);
+        x[0] = -9; x[1] = 9; x[2] = 3;
+        assert(iamax(x.lightConst) == 0);
+        auto empty = x[0 .. 0];
+        assert(dot(empty.lightConst, empty.lightConst) == 0);
+        assert(nrm2(empty.lightConst) == 0);
+        assert(asum(empty.lightConst) == 0);
+        assert(iamax(empty.lightConst) == 0);
+        scal(5.0, empty);
+        auto single = x[0 .. 1];
+        assert(asum(single.lightConst) == 9);
+        assert(iamax(single.lightConst) == 0);
+        foreach (i; 0 .. 8)
+            if (i != 1 && i != 3 && i != 5)
+                assert(sx[i] == -99 && sy[i] == -99);
+    }
+}
+
+// Complex absolute sums and maximum indices use |real| + |imaginary|.
+@safe pure nothrow @nogc
+unittest
+{
+    alias T = cblas._cdouble;
+    T[5] storage = T(-99);
+    auto x = storage[1 .. 4].sliced.universal.reversed;
+    x[0] = T(3, 4); x[1] = T(-3, -4); x[2] = T(6, 0);
+    assert(iamax(x.lightConst) == 0); // magnitude squared would select index 2
+    assert(asum(x.lightConst) == 20);
+    import std.math: fabs, sqrt;
+    assert(fabs(nrm2(x.lightConst) - sqrt(86.0)) < 1e-12);
+    T[3] output;
+    auto y = output[].sliced;
+    copy(x.lightConst, y);
+    scal(T(2), x);
+    axpy(T(-1), y.lightConst, x);
+    foreach (i; 0 .. 3) assert(x[i] == y[i]);
+    assert(storage[0] == T(-99) && storage[4] == T(-99));
+}
+
+// Exercise every level-2 vector boundary against its positive-stride result.
+// Constructing packed StairsIterator fixtures requires system access.
+@system pure nothrow @nogc
+unittest
+{
+    import std.math: fabs;
+    foreach (reverseX; [false, true])
+    foreach (reverseY; [false, true])
+    {
+        double[8] sx = -99, sy = -99;
+        double[3] rx = [1, 2, 3], ry = [4, 5, 6];
+        auto x = sx[1 .. 6].sliced.universal.strided(2);
+        auto y = sy[1 .. 6].sliced.universal.strided(2);
+        if (reverseX) x = x.reversed;
+        if (reverseY) y = y.reversed;
+        foreach (i; 0 .. 3) { x[i] = rx[i]; y[i] = ry[i]; }
+        auto xr = rx[].sliced;
+        auto yr = ry[].sliced;
+        double[9] sa = [2, 1, 3, 1, 4, 2, 3, 2, 5], ra = sa;
+        auto a = sa[].sliced(3, 3);
+        auto ar = ra[].sliced(3, 3);
+        ger(2.0, x.lightConst, y.lightConst, a);
+        ger(2.0, xr.lightConst, yr.lightConst, ar);
+        assert(sa == ra);
+        gerc(1.0, x.lightConst, y.lightConst, a);
+        gerc(1.0, xr.lightConst, yr.lightConst, ar);
+        assert(sa == ra);
+        syr(Uplo.Upper, 2.0, x.lightConst, a);
+        syr(Uplo.Upper, 2.0, xr.lightConst, ar);
+        assert(sa == ra);
+        gemv(2.0, a.lightConst, x.lightConst, 3.0, y);
+        gemv(2.0, ar.lightConst, xr.lightConst, 3.0, yr);
+        foreach (i; 0 .. 3) assert(y[i] == yr[i]);
+        symv(Uplo.Upper, 2.0, a.lightConst, x.lightConst, 3.0, y);
+        symv(Uplo.Upper, 2.0, ar.lightConst, xr.lightConst, 3.0, yr);
+        foreach (i; 0 .. 3) assert(y[i] == yr[i]);
+        trmv(Uplo.Upper, cblas.Diag.NonUnit, a.lightConst, x);
+        trmv(Uplo.Upper, cblas.Diag.NonUnit, ar.lightConst, xr);
+        foreach (i; 0 .. 3) assert(x[i] == xr[i]);
+        trsv(Uplo.Upper, cblas.Diag.NonUnit, a.lightConst, x);
+        trsv(Uplo.Upper, cblas.Diag.NonUnit, ar.lightConst, xr);
+        foreach (i; 0 .. 3) assert(fabs(x[i] - xr[i]) < 1e-12);
+        double[6] packed = [2, 3, 4, 5, 6, 7], packedRef = packed;
+        auto p = packed[].sliced.stairs!"-"(3);
+        auto pr = packedRef[].sliced.stairs!"-"(3);
+        spr(2.0, x.lightConst, p);
+        spr(2.0, xr.lightConst, pr);
+        assert(packed == packedRef);
+        spmv(2.0, p, x.lightConst, 3.0, y);
+        spmv(2.0, pr, xr.lightConst, 3.0, yr);
+        foreach (i; 0 .. 3) assert(fabs(y[i] - yr[i]) < 1e-8);
+        tpmv(cblas.Diag.NonUnit, p, x);
+        tpmv(cblas.Diag.NonUnit, pr, xr);
+        foreach (i; 0 .. 3) assert(fabs(x[i] - xr[i]) < 1e-10);
+        tpsv(cblas.Diag.NonUnit, p, x);
+        tpsv(cblas.Diag.NonUnit, pr, xr);
+        foreach (i; 0 .. 3) assert(fabs(x[i] - xr[i]) < 1e-12);
+        foreach (i; 0 .. 8)
+            if (i != 1 && i != 3 && i != 5)
+                assert(sx[i] == -99 && sy[i] == -99);
+    }
 }
