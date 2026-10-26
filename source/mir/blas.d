@@ -209,8 +209,8 @@ do
     gerImpl(
         transA ? cblas.Order.ColMajor : cblas.Order.RowMajor,
 
-        cast(cblas.blasint) a.length!0,
-        cast(cblas.blasint) a.length!1,
+        cast(cblas.blasint) x.length,
+        cast(cblas.blasint) y.length,
 
         alpha,
 
@@ -263,8 +263,8 @@ do
     gerImpl(
         transA ? cblas.Order.ColMajor : cblas.Order.RowMajor,
 
-        cast(cblas.blasint) a.length!0,
-        cast(cblas.blasint) a.length!1,
+        cast(cblas.blasint) x.length,
+        cast(cblas.blasint) y.length,
 
         alpha,
 
@@ -277,6 +277,55 @@ do
         a.iterator,
         cast(cblas.blasint) a.matrixStride,
     );
+}
+
+// Rectangular updates keep logical dimensions when storage is transposed.
+@safe pure nothrow @nogc
+unittest
+{
+    import std.meta: AliasSeq;
+    static foreach (T; AliasSeq!(float, double, cblas._cfloat, cblas._cdouble))
+    {{
+        foreach (m; [2, 3])
+        foreach (transposeA; [false, true])
+        foreach (conjugate; [false, true])
+        {
+            auto n = 5 - m;
+            T[20] storage, reference;
+            storage[] = reference[] = T(-99);
+            auto a = storage[].sliced(4, 5)
+                [0 .. (transposeA ? n : m), 0 .. (transposeA ? m : n)].universal;
+            auto expected = reference[].sliced(4, 5)
+                [0 .. (transposeA ? n : m), 0 .. (transposeA ? m : n)].universal;
+            if (transposeA)
+            {
+                a = a.transposed;
+                expected = expected.transposed;
+            }
+            T[3] xs, ys;
+            foreach (i; 0 .. m) xs[i] = T(i + 1);
+            foreach (j; 0 .. n)
+            {
+                static if (isFloatingPoint!T) ys[j] = T(j + 2);
+                else ys[j] = T(j + 2, j + 1);
+            }
+            foreach (i; 0 .. m)
+            foreach (j; 0 .. n)
+            {
+                auto y = ys[j];
+                static if (!isFloatingPoint!T)
+                    if (conjugate) y = T(y.re, -y.im);
+                a[i, j] = T(1);
+                expected[i, j] = T(1) + T(2) * xs[i] * y;
+            }
+            if (conjugate)
+                gerc(T(2), xs[0 .. m].sliced.lightConst, ys[0 .. n].sliced.lightConst, a);
+            else
+                ger(T(2), xs[0 .. m].sliced.lightConst, ys[0 .. n].sliced.lightConst, a);
+            // Also verify that padding outside the supplied view is untouched.
+            assert(storage == reference);
+        }
+    }}
 }
 
 ///
