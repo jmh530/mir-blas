@@ -555,6 +555,8 @@ do
         if (a._stride!1 != 1)
         {
             a = a.transposed;
+            // UPLO describes the stored matrix before applying TransA.
+            uplo = uplo == cblas.Uplo.Upper ? cblas.Uplo.Lower : cblas.Uplo.Upper;
             transA = true;
         }
         assert(a._stride!1 == 1, "Matrix A must have a stride equal to 1.");
@@ -580,6 +582,70 @@ do
         b.iterator,
         cast(cblas.blasint) b.matrixStride,
     );
+}
+
+// Exercise logical triangles independently of their physical storage layout.
+@safe pure nothrow @nogc
+unittest
+{
+    foreach (side; [cblas.Side.Left, cblas.Side.Right])
+    foreach (uplo; [cblas.Uplo.Upper, cblas.Uplo.Lower])
+    foreach (diag; [cblas.Diag.NonUnit, cblas.Diag.Unit])
+    foreach (transposeA; [false, true])
+    foreach (transposeB; [false, true])
+    {
+        // Padded leading dimensions catch accidental assumptions of contiguity.
+        double[15] storageA;
+        double[15] storageB;
+        auto a = storageA[].sliced(3, 5)[0 .. 3, 0 .. 3].universal;
+        if (transposeA)
+            a = a.transposed;
+        size_t rows = side == cblas.Side.Left ? 3 : 2;
+        size_t cols = side == cblas.Side.Left ? 2 : 3;
+        auto b = storageB[].sliced(3, 5)
+            [0 .. (transposeB ? cols : rows), 0 .. (transposeB ? rows : cols)].universal;
+        if (transposeB)
+            b = b.transposed;
+        double[9] dense;
+        foreach (i; 0 .. 3)
+        foreach (j; 0 .. 3)
+        {
+            bool selected = uplo == cblas.Uplo.Upper ? i <= j : i >= j;
+            double value = i == j ? 2 : i + j + 1;
+            dense[i * 3 + j] = selected ? value : 0;
+            if (i == j && diag == cblas.Diag.Unit)
+                dense[i * 3 + j] = 1;
+            a[i, j] = selected && !(i == j && diag == cblas.Diag.Unit)
+                ? value : double.nan;
+        }
+        double[6] original;
+        double[6] expected;
+        foreach (i; 0 .. rows)
+        foreach (j; 0 .. cols)
+            original[i * cols + j] = b[i, j] = i * cols + j + 1;
+        foreach (i; 0 .. rows)
+        foreach (j; 0 .. cols)
+        {
+            double sum = 0;
+            foreach (k; 0 .. 3)
+                sum += side == cblas.Side.Left
+                    ? dense[i * 3 + k] * original[k * cols + j]
+                    : original[i * cols + k] * dense[k * 3 + j];
+            expected[i * cols + j] = 2 * sum;
+        }
+        trmm(side, uplo, diag, 2.0, a.lightConst, b);
+        foreach (i; 0 .. rows)
+        foreach (j; 0 .. cols)
+        {
+            assert(b[i, j] == expected[i * cols + j]);
+            // Supply the independent reference to the solve regression.
+            b[i, j] = expected[i * cols + j];
+        }
+        trsm(side, uplo, diag, 0.5, a.lightConst, b);
+        foreach (i; 0 .. rows)
+        foreach (j; 0 .. cols)
+            assert(b[i, j] == original[i * cols + j]);
+    }
 }
 
 /// Example: Left/Upper/NonUnit
@@ -740,6 +806,8 @@ do
         if (a._stride!1 != 1)
         {
             a = a.transposed;
+            // UPLO describes the stored matrix before applying TransA.
+            uplo = uplo == cblas.Uplo.Upper ? cblas.Uplo.Lower : cblas.Uplo.Upper;
             transA = true;
         }
         assert(a._stride!1 == 1, "Matrix A must have a stride equal to 1.");
