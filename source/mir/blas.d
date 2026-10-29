@@ -3,7 +3,9 @@ Low-level ndslice wrapper for BLAS.
 
 Vector arguments follow the logical order of their ndslice views, including
 reversed views and non-unit strides. Maximum indices refer to that logical
-order; ties select the first maximum.
+order; for inputs without NaNs, ties select the first maximum. Maximum-index
+results for NaN-containing inputs are unspecified and may depend on the backend
+and view layout.
 
 Authors: Ilya Yaroshenko
 Copyright:  Copyright © 2017, Symmetry Investments & Kaleidic Associates
@@ -380,6 +382,73 @@ unittest
     }}
 }
 
+// Rectangular updates also support reversed, nonunit complex vectors.
+@safe pure nothrow @nogc
+unittest
+{
+    import std.meta: AliasSeq;
+    static foreach (T; AliasSeq!(cblas._cfloat, cblas._cdouble))
+    {{
+        foreach (m; [2, 3])
+        foreach (transposeA; [false, true])
+        foreach (conjugate; [false, true])
+        foreach (reverseX; [false, true])
+        foreach (reverseY; [false, true])
+        {
+            auto n = 5 - m;
+            T[20] storage, reference;
+            storage[] = reference[] = testValue!T(-99);
+            auto a = storage[].sliced(4, 5)
+                [0 .. (transposeA ? n : m), 0 .. (transposeA ? m : n)].universal;
+            auto expected = reference[].sliced(4, 5)
+                [0 .. (transposeA ? n : m), 0 .. (transposeA ? m : n)].universal;
+            if (transposeA)
+            {
+                a = a.transposed;
+                expected = expected.transposed;
+            }
+            T[8] xStorage, yStorage;
+            xStorage[] = yStorage[] = testValue!T(-99);
+            auto xs = xStorage[1 .. 2 * m].sliced.universal.strided(2);
+            auto ys = yStorage[1 .. 2 * n].sliced.universal.strided(2);
+            if (reverseX) xs = xs.reversed;
+            if (reverseY) ys = ys.reversed;
+            static if (isFloatingPoint!T) auto alpha = testValue!T(2);
+            else auto alpha = testValue!T(2, -1);
+            foreach (i; 0 .. m)
+            {
+                static if (isFloatingPoint!T) xs[i] = testValue!T(i + 1);
+                else xs[i] = testValue!T(i + 1, i + 2);
+            }
+            foreach (j; 0 .. n)
+            {
+                static if (isFloatingPoint!T) ys[j] = testValue!T(j + 2);
+                else ys[j] = testValue!T(j + 2, j + 1);
+            }
+            foreach (i; 0 .. m)
+            foreach (j; 0 .. n)
+            {
+                auto y = ys[j];
+                static if (!isFloatingPoint!T)
+                    if (conjugate) y = testValue!T(y.re, -y.im);
+                a[i, j] = testValue!T(1);
+                expected[i, j] = testValue!T(1) + alpha * xs[i] * y;
+            }
+            if (conjugate)
+                gerc(alpha, xs.lightConst, ys.lightConst, a);
+            else
+                ger(alpha, xs.lightConst, ys.lightConst, a);
+            // Also verify that padding outside the supplied view is untouched.
+            assert(storage == reference);
+            foreach (i; 0 .. 8)
+            {
+                if (i % 2 == 0 || i >= 2 * m) assert(xStorage[i] == testValue!T(-99));
+                if (i % 2 == 0 || i >= 2 * n) assert(yStorage[i] == testValue!T(-99));
+            }
+        }
+    }}
+}
+
 ///
 @trusted pure nothrow @nogc
 void gemv(T,
@@ -689,64 +758,98 @@ do
 @safe pure nothrow @nogc
 unittest
 {
-    foreach (side; [cblas.Side.Left, cblas.Side.Right])
-    foreach (uplo; [cblas.Uplo.Upper, cblas.Uplo.Lower])
-    foreach (diag; [cblas.Diag.NonUnit, cblas.Diag.Unit])
-    foreach (transposeA; [false, true])
-    foreach (transposeB; [false, true])
-    {
-        // Padded leading dimensions catch accidental assumptions of contiguity.
-        double[15] storageA;
-        double[15] storageB;
-        auto a = storageA[].sliced(3, 5)[0 .. 3, 0 .. 3].universal;
-        if (transposeA)
-            a = a.transposed;
-        size_t rows = side == cblas.Side.Left ? 3 : 2;
-        size_t cols = side == cblas.Side.Left ? 2 : 3;
-        auto b = storageB[].sliced(3, 5)
-            [0 .. (transposeB ? cols : rows), 0 .. (transposeB ? rows : cols)].universal;
-        if (transposeB)
-            b = b.transposed;
-        double[9] dense;
-        foreach (i; 0 .. 3)
-        foreach (j; 0 .. 3)
+    import std.meta: AliasSeq;
+    import std.math: fabs;
+    static foreach (T; AliasSeq!(double, cblas._cfloat, cblas._cdouble))
+    {{
+        foreach (side; [cblas.Side.Left, cblas.Side.Right])
+        foreach (uplo; [cblas.Uplo.Upper, cblas.Uplo.Lower])
+        foreach (diag; [cblas.Diag.NonUnit, cblas.Diag.Unit])
+        foreach (transposeA; [false, true])
+        foreach (transposeB; [false, true])
         {
-            bool selected = uplo == cblas.Uplo.Upper ? i <= j : i >= j;
-            double value = i == j ? 2 : i + j + 1;
-            dense[i * 3 + j] = selected ? value : 0;
-            if (i == j && diag == cblas.Diag.Unit)
-                dense[i * 3 + j] = 1;
-            a[i, j] = selected && !(i == j && diag == cblas.Diag.Unit)
-                ? value : double.nan;
+            // Padded leading dimensions catch accidental assumptions of contiguity.
+            T[15] storageA;
+            T[15] storageB;
+            storageB[] = testValue!T(-99);
+            static if (isFloatingPoint!T) auto alpha = testValue!T(2);
+            else auto alpha = testValue!T(2, 1);
+            auto a = storageA[].sliced(3, 5)[0 .. 3, 0 .. 3].universal;
+            if (transposeA)
+                a = a.transposed;
+            size_t rows = side == cblas.Side.Left ? 3 : 2;
+            size_t cols = side == cblas.Side.Left ? 2 : 3;
+            auto b = storageB[].sliced(3, 5)
+                [0 .. (transposeB ? cols : rows), 0 .. (transposeB ? rows : cols)].universal;
+            if (transposeB)
+                b = b.transposed;
+            T[9] dense;
+            foreach (i; 0 .. 3)
+            foreach (j; 0 .. 3)
+            {
+                bool selected = uplo == cblas.Uplo.Upper ? i <= j : i >= j;
+                static if (isFloatingPoint!T)
+                    auto value = testValue!T(i == j ? 2 : i + j + 1);
+                else
+                    auto value = testValue!T(i == j ? 2 : i + j + 1, i == j ? 1 : i + 1);
+                dense[i * 3 + j] = selected ? value : testValue!T(0);
+                if (i == j && diag == cblas.Diag.Unit)
+                    dense[i * 3 + j] = testValue!T(1);
+                // Keep separate assignments to avoid a Windows x64 DMD -inline crash
+                // with built-in cfloat: https://github.com/dlang/dmd/issues/24119
+                if (selected && !(i == j && diag == cblas.Diag.Unit))
+                    a[i, j] = value;
+                else
+                    a[i, j] = testValue!T(double.nan);
+            }
+            T[6] original;
+            T[6] expected;
+            foreach (i; 0 .. rows)
+            foreach (j; 0 .. cols)
+            {
+                static if (isFloatingPoint!T) auto value = testValue!T(i * cols + j + 1);
+                else auto value = testValue!T(i * cols + j + 1, j + 1);
+                original[i * cols + j] = b[i, j] = value;
+            }
+            foreach (i; 0 .. rows)
+            foreach (j; 0 .. cols)
+            {
+                T sum = testValue!T(0);
+                foreach (k; 0 .. 3)
+                    sum += side == cblas.Side.Left
+                        ? dense[i * 3 + k] * original[k * cols + j]
+                        : original[i * cols + k] * dense[k * 3 + j];
+                expected[i * cols + j] = alpha * sum;
+            }
+            trmm(side, uplo, diag, alpha, a.lightConst, b);
+            foreach (i; 0 .. rows)
+            foreach (j; 0 .. cols)
+            {
+                assert(b[i, j] == expected[i * cols + j]);
+                // Supply the independent reference to the solve regression.
+                b[i, j] = expected[i * cols + j];
+            }
+            foreach (i; 0 .. 3)
+            foreach (j; 0 .. 5)
+                if (i >= (transposeB ? cols : rows) || j >= (transposeB ? rows : cols))
+                    assert(storageB[i * 5 + j] == testValue!T(-99));
+            trsm(side, uplo, diag, testValue!T(1) / alpha, a.lightConst, b);
+            foreach (i; 0 .. rows)
+            foreach (j; 0 .. cols)
+            {
+                auto difference = b[i, j] - original[i * cols + j];
+                static if (is(T == cblas._cfloat)) enum tolerance = 1e-4;
+                else enum tolerance = 1e-12;
+                static if (isFloatingPoint!T) assert(fabs(difference) < tolerance);
+                else assert(fabs(difference.re) < tolerance && fabs(difference.im) < tolerance);
+            }
+            foreach (i; 0 .. 3)
+            foreach (j; 0 .. 5)
+                if (i >= (transposeB ? cols : rows) || j >= (transposeB ? rows : cols))
+                    assert(storageB[i * 5 + j] == testValue!T(-99));
+
         }
-        double[6] original;
-        double[6] expected;
-        foreach (i; 0 .. rows)
-        foreach (j; 0 .. cols)
-            original[i * cols + j] = b[i, j] = i * cols + j + 1;
-        foreach (i; 0 .. rows)
-        foreach (j; 0 .. cols)
-        {
-            double sum = 0;
-            foreach (k; 0 .. 3)
-                sum += side == cblas.Side.Left
-                    ? dense[i * 3 + k] * original[k * cols + j]
-                    : original[i * cols + k] * dense[k * 3 + j];
-            expected[i * cols + j] = 2 * sum;
-        }
-        trmm(side, uplo, diag, 2.0, a.lightConst, b);
-        foreach (i; 0 .. rows)
-        foreach (j; 0 .. cols)
-        {
-            assert(b[i, j] == expected[i * cols + j]);
-            // Supply the independent reference to the solve regression.
-            b[i, j] = expected[i * cols + j];
-        }
-        trsm(side, uplo, diag, 0.5, a.lightConst, b);
-        foreach (i; 0 .. rows)
-        foreach (j; 0 .. cols)
-            assert(b[i, j] == original[i * cols + j]);
-    }
+    }}
 }
 
 /// Example: Left/Upper/NonUnit
@@ -1110,9 +1213,13 @@ unittest
 }
 
 /++
-Return the index of the first element of maximum absolute value in the logical
-view. Complex elements use `abs(real) + abs(imaginary)`. An empty view returns
-zero, following the CBLAS convention.
+Return the index of the maximum absolute value in logical view order. For
+inputs without NaNs, ties select the first logical maximum. Complex elements
+use `abs(real) + abs(imaginary)`. An empty view returns zero, following the
+CBLAS convention.
+
+Results for NaN-containing inputs are unspecified and may depend on the BLAS
+backend and view layout.
 +/
 @trusted pure nothrow @nogc
 auto iamax(T,
