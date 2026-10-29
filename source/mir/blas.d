@@ -308,6 +308,29 @@ do
     );
 }
 
+version(unittest)
+{
+    /// Construct real or complex test values with old and new CBLAS bindings.
+    // cblas 2.0.4 through 2.1.1 default to built-in complex types, which do not
+    // support the struct-style constructors used by newer bindings. Remove this
+    // helper and replace its calls with direct constructors only after raising
+    // the minimum cblas version to 2.2.0 or later and checking the tests with
+    // every supported complex configuration, including CBLAS_STD_COMPLEX.
+    // This compatibility requirement is independent of the DMD #24119 workaround.
+    private T testValue(T)(real re, real im = 0) @safe pure nothrow @nogc
+    {
+        static if (isFloatingPoint!T)
+        {
+            assert(im == 0);
+            return cast(T) re;
+        }
+        else static if (is(T == cfloat) || is(T == cdouble) || is(T == creal))
+            return cast(T) (re + im * 1.0Li);
+        else
+            return T(cast(typeof(T.init.re)) re, cast(typeof(T.init.im)) im);
+    }
+}
+
 // Rectangular updates keep logical dimensions when storage is transposed.
 @safe pure nothrow @nogc
 unittest
@@ -321,7 +344,7 @@ unittest
         {
             auto n = 5 - m;
             T[20] storage, reference;
-            storage[] = reference[] = T(-99);
+            storage[] = reference[] = testValue!T(-99);
             auto a = storage[].sliced(4, 5)
                 [0 .. (transposeA ? n : m), 0 .. (transposeA ? m : n)].universal;
             auto expected = reference[].sliced(4, 5)
@@ -332,25 +355,25 @@ unittest
                 expected = expected.transposed;
             }
             T[3] xs, ys;
-            foreach (i; 0 .. m) xs[i] = T(i + 1);
+            foreach (i; 0 .. m) xs[i] = testValue!T(i + 1);
             foreach (j; 0 .. n)
             {
-                static if (isFloatingPoint!T) ys[j] = T(j + 2);
-                else ys[j] = T(j + 2, j + 1);
+                static if (isFloatingPoint!T) ys[j] = testValue!T(j + 2);
+                else ys[j] = testValue!T(j + 2, j + 1);
             }
             foreach (i; 0 .. m)
             foreach (j; 0 .. n)
             {
                 auto y = ys[j];
                 static if (!isFloatingPoint!T)
-                    if (conjugate) y = T(y.re, -y.im);
-                a[i, j] = T(1);
-                expected[i, j] = T(1) + T(2) * xs[i] * y;
+                    if (conjugate) y = testValue!T(y.re, -y.im);
+                a[i, j] = testValue!T(1);
+                expected[i, j] = testValue!T(1) + testValue!T(2) * xs[i] * y;
             }
             if (conjugate)
-                gerc(T(2), xs[0 .. m].sliced.lightConst, ys[0 .. n].sliced.lightConst, a);
+                gerc(testValue!T(2), xs[0 .. m].sliced.lightConst, ys[0 .. n].sliced.lightConst, a);
             else
-                ger(T(2), xs[0 .. m].sliced.lightConst, ys[0 .. n].sliced.lightConst, a);
+                ger(testValue!T(2), xs[0 .. m].sliced.lightConst, ys[0 .. n].sliced.lightConst, a);
             // Also verify that padding outside the supplied view is untouched.
             assert(storage == reference);
         }
@@ -1873,9 +1896,9 @@ unittest
 unittest
 {
     alias T = cblas._cdouble;
-    T[5] storage = T(-99);
+    T[5] storage = testValue!T(-99);
     auto x = storage[1 .. 4].sliced.universal.reversed;
-    x[0] = T(3, 4); x[1] = T(-3, -4); x[2] = T(6, 0);
+    x[0] = testValue!T(3, 4); x[1] = testValue!T(-3, -4); x[2] = testValue!T(6, 0);
     assert(iamax(x.lightConst) == 0); // magnitude squared would select index 2
     assert(asum(x.lightConst) == 20);
     import std.math: fabs, sqrt;
@@ -1883,10 +1906,10 @@ unittest
     T[3] output;
     auto y = output[].sliced;
     copy(x.lightConst, y);
-    scal(T(2), x);
-    axpy(T(-1), y.lightConst, x);
+    scal(testValue!T(2), x);
+    axpy(testValue!T(-1), y.lightConst, x);
     foreach (i; 0 .. 3) assert(x[i] == y[i]);
-    assert(storage[0] == T(-99) && storage[4] == T(-99));
+    assert(storage[0] == testValue!T(-99) && storage[4] == testValue!T(-99));
 }
 
 // Exercise every level-2 vector boundary against its positive-stride result.
