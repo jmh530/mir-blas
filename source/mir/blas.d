@@ -34,6 +34,7 @@ private auto matrixStride(S)(S a)
 // offset for negative increments, so supply the lowest-addressed element.
 // For a nonempty valid view this is another element of the same allocation;
 // empty views must not perform pointer arithmetic. Used only by trusted FFI calls.
+pragma(inline, true)
 private auto vectorBase(T, SliceKind kind)(Slice!(T*, 1, kind) x)
     @system pure nothrow @nogc
 {
@@ -1231,7 +1232,7 @@ auto iamax(T,
     if (x._stride < 0 && x.length)
     {
         // A forward native call would choose the last logical maximum on ties.
-        import std.math: fabs;
+        import mir.math.common: fabs;
         auto magnitude(T value)
         {
             static if (isFloatingPoint!T)
